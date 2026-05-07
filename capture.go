@@ -7,18 +7,20 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/howardjohn/log-helper/pkg/color"
 )
 
 const (
-	SNAPSHOTLENGTH int32         = 65535            // Snapshot length
-	PROMISCUOUS    bool          = false            // Promiscuous mode
-	TIMEOUT        time.Duration = -1 * time.Second // Timeout
+	SNAPSHOTLENGTH int32         = 65535                 // Snapshot length
+	PROMISCUOUS    bool          = false                 // Promiscuous mode
+	TIMEOUT        time.Duration = time.Millisecond * 20 // Timeout
 )
 
 var (
@@ -143,16 +145,40 @@ func (d *Devices) GetDevice(s string) (Device, error) {
 	return retDev, errors.New("error finding device")
 }
 
-func printPacket(p gopacket.Packet) {
+var variants = []float64{0, 0.5, -0.25, 0.25, 0.75, -0.375, -0.125}
+
+type Color struct {
+	last     int
+	variants map[string]int
+	colors    []color.Color
+}
+
+func (m *Color) Color(data string) string {
+	return  m.ColorFor(data).Sprint(data)
+}
+func (m *Color) ColorFor(data string) color.Color {
+	iter, f := m.variants[data]
+	if !f {
+		m.variants[data] = m.last
+		iter = m.last
+		m.last++
+	}
+	col := m.colors[iter%len(m.colors)]
+	adj := iter/len(m.colors)
+	return color.Adjust(col, variants[adj%len(variants)])
+}
+
+func printPacket(c *Color, p gopacket.Packet) {
 	// Variables we want to print
 	var src_ip string
 	var src_port string
 	var des_ip string
 	var des_port string
 	var proto string
-	sendtime := p.Metadata().Timestamp.Format("2006/01/02 15:04:05")
+	sendtime := formatDate(p.Metadata().Timestamp)
 	packetlength := p.Metadata().Length
-
+	var payload []byte
+	var mode []string
 	// Check if it is IPv6
 	ip6Layer := p.Layer(layers.LayerTypeIPv6)
 	if ip6Layer != nil {
@@ -185,18 +211,35 @@ func printPacket(p gopacket.Packet) {
 	udpLayer := p.Layer(layers.LayerTypeUDP)
 	if udpLayer != nil {
 		udp, _ := udpLayer.(*layers.UDP)
-		src_port = udp.SrcPort.String()
-		des_port = udp.DstPort.String()
+		src_port = strconv.Itoa(int(udp.SrcPort))
+		des_port = strconv.Itoa(int(udp.DstPort))
 		proto = "UDP"
+		payload = udp.Payload
 	}
 
 	// Check if it is TCP
 	tcpLayer := p.Layer(layers.LayerTypeTCP)
 	if tcpLayer != nil {
 		tcp, _ := tcpLayer.(*layers.TCP)
-		src_port = tcp.SrcPort.String()
-		des_port = tcp.DstPort.String()
+		src_port = strconv.Itoa(int(tcp.SrcPort))
+		des_port = strconv.Itoa(int(tcp.DstPort))
 		proto = "TCP"
+		payload = tcpLayer.LayerPayload()
+		if tcp.FIN {
+			mode = append(mode, "FIN")
+		}
+		if tcp.SYN {
+			mode = append(mode, "SYN")
+		}
+		if tcp.RST {
+			mode = append(mode, "RST")
+		}
+		if tcp.PSH {
+			mode = append(mode, "PSH")
+		}
+		if tcp.ACK {
+			mode = append(mode, "ACK")
+		}
 	}
 
 	// Check if it is ARP
@@ -218,9 +261,16 @@ func printPacket(p gopacket.Packet) {
 	// Print out the details if there is a port associated
 	var o string
 	if src_port != "" {
-		o = fmt.Sprintf("%s %s %s:%s --> %s:%s (len:%d)", sendtime, proto, src_ip, src_port, des_ip, des_port, packetlength)
+		ms := ""
+		if mode != nil {
+			ms = " (" + strings.Join(mode, ",") + ")"
+		}
+		o = fmt.Sprintf("%s %s %s --> %s (len:%d)%s", sendtime, proto, c.Color(src_ip + ":" + src_port), c.Color(des_ip + ":" + des_port), packetlength, ms)
 	} else {
 		o = fmt.Sprintf("%s %s %s --> %s (len:%d)", sendtime, proto, src_ip, des_ip, packetlength)
+	}
+	if payload != nil {
+		o += fmt.Sprintf("\n%v", string(payload))
 	}
 
 	fmt.Println(o)
@@ -256,12 +306,24 @@ func (d *Device) Start() {
 	// Start processing packets
 	source := gopacket.NewPacketSource(handler, handler.LinkType())
 
+	cc := &Color{
+		last:     0,
+		variants: make(map[string]int),
+		colors:    []color.Color{
+			color.Hex(`#cb4b16`),
+			color.Hex(`#a2ba00`),
+			color.Hex(`#e1ab00`),
+			color.Hex(`#0096ff`),
+			color.Hex(`#6c71c4`),
+			color.Hex(`#31bbb0`),
+		},
+	}
 	for packet := range source.Packets() {
 		// Increase the number of packets we have processed
 		numpackets++
 
 		// Print details of the packet
-		printPacket(packet)
+		printPacket(cc, packet)
 
 		// Check if we should write the packe to disk
 		if outputfile != "" {
@@ -275,4 +337,43 @@ func (d *Device) Start() {
 		}
 	}
 
+}
+
+func formatDate(t time.Time) string {
+	t = t.UTC()
+	year, month, day := t.Date()
+	hour, minute, second := t.Clock()
+	micros := t.Nanosecond() / 1000
+
+	buf := make([]byte, 27)
+
+	buf[0] = byte((year/1000)%10) + '0'
+	buf[1] = byte((year/100)%10) + '0'
+	buf[2] = byte((year/10)%10) + '0'
+	buf[3] = byte(year%10) + '0'
+	buf[4] = '-'
+	buf[5] = byte((month)/10) + '0'
+	buf[6] = byte((month)%10) + '0'
+	buf[7] = '-'
+	buf[8] = byte((day)/10) + '0'
+	buf[9] = byte((day)%10) + '0'
+	buf[10] = 'T'
+	buf[11] = byte((hour)/10) + '0'
+	buf[12] = byte((hour)%10) + '0'
+	buf[13] = ':'
+	buf[14] = byte((minute)/10) + '0'
+	buf[15] = byte((minute)%10) + '0'
+	buf[16] = ':'
+	buf[17] = byte((second)/10) + '0'
+	buf[18] = byte((second)%10) + '0'
+	buf[19] = '.'
+	buf[20] = byte((micros/100000)%10) + '0'
+	buf[21] = byte((micros/10000)%10) + '0'
+	buf[22] = byte((micros/1000)%10) + '0'
+	buf[23] = byte((micros/100)%10) + '0'
+	buf[24] = byte((micros/10)%10) + '0'
+	buf[25] = byte((micros)%10) + '0'
+	buf[26] = 'Z'
+
+	return string(buf)
 }
